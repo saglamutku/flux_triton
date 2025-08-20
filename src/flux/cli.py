@@ -1,14 +1,15 @@
 import os
+import contextlib
 import re
 import time
 from dataclasses import dataclass
 from glob import iglob
-
+import torch._inductor.config as cfg
 import torch
 from einops import rearrange
 from fire import Fire
 from PIL import ExifTags, Image
-
+from torch.profiler import ProfilerActivity, profile, record_function
 from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
 from flux.util import (
     configs,
@@ -22,6 +23,7 @@ from transformers import pipeline
 
 NSFW_THRESHOLD = 0.85
 
+cfg.trace.log_autotuning_results = True # enable the log of autotuning results
 
 @dataclass
 class SamplingOptions:
@@ -119,6 +121,9 @@ def main(
     offload: bool = False,
     output_dir: str = "output",
     add_sampling_metadata: bool = True,
+    profile_json: str | None = None,
+    warmup: bool = True,
+    warmup_steps: int | None = 1,
 ):
     """
     Sample the flux model. Either interactively (set `--loop`) or run for a
@@ -173,6 +178,8 @@ def main(
     t5 = load_t5(torch_device, max_length=256 if name == "flux-schnell" else 512)
     clip = load_clip(torch_device)
     model = load_flow_model(name, device="cpu" if offload else torch_device)
+    model = torch.compile(model, mode="max-autotune", fullgraph=True, dynamic=False, backend="inductor")
+    model.eval()
     ae = load_ae(name, device="cpu" if offload else torch_device)
 
     rng = torch.Generator(device="cpu")
@@ -185,6 +192,55 @@ def main(
         seed=seed,
     )
 
+    # Optional one-time warm-up to trigger JIT/inductor/triton compilation and memory caches
+    if warmup:
+        try:
+            print("Warm-up: running an unmeasured dry run to compile kernels...")
+            # Do not mutate opts.seed here; use a fixed seed for determinism if None
+            _seed = opts.seed if opts.seed is not None else 0
+            # Prepare input
+            xw = get_noise(
+                1,
+                opts.height,
+                opts.width,
+                device=torch_device,
+                dtype=torch.bfloat16,
+                seed=_seed,
+            )
+            if offload:
+                ae = ae.cpu()
+                torch.cuda.empty_cache()
+                t5, clip = t5.to(torch_device), clip.to(torch_device)
+            inpw = prepare(t5, clip, xw, prompt=opts.prompt)
+            steps_w = warmup_steps if (warmup_steps is not None and warmup_steps > 0) else 1
+            tsteps_w = get_schedule(
+                steps_w, inpw["img"].shape[1], shift=(name != "flux-schnell")
+            )
+            if offload:
+                t5, clip = t5.cpu(), clip.cpu()
+                torch.cuda.empty_cache()
+                model = model.to(torch_device)
+            # Denoise and decode
+            xw = denoise(model, **inpw, timesteps=tsteps_w, guidance=opts.guidance)
+            if offload:
+                model.cpu()
+                torch.cuda.empty_cache()
+                ae.decoder.to(xw.device)
+            xw = unpack(xw.float(), opts.height, opts.width)
+            with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                xw = ae.decode(xw)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            # Return AE to CPU to keep device state consistent when offloading
+            if offload:
+                ae = ae.cpu()
+            # Drop warm-up outputs
+            del xw
+            print("Warm-up: done.")
+        except (RuntimeError, ValueError) as e:
+            # Warm-up is best-effort; continue even if it fails
+            print(f"Warm-up skipped due to error: {e}")
+
     if loop:
         opts = parse_prompt(opts)
 
@@ -193,48 +249,86 @@ def main(
             opts.seed = rng.seed()
         print(f"Generating with seed {opts.seed}:\n{opts.prompt}")
         t0 = time.perf_counter()
-
-        # prepare input
-        x = get_noise(
-            1,
-            opts.height,
-            opts.width,
-            device=torch_device,
-            dtype=torch.bfloat16,
-            seed=opts.seed,
+        
+        activities = [ProfilerActivity.CPU]
+        
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+        prof_cm = (
+            profile(
+                activities=activities,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_modules=True
+            )
+            if profile_json
+            else contextlib.nullcontext()
         )
-        opts.seed = None
-        if offload:
-            ae = ae.cpu()
-            torch.cuda.empty_cache()
-            t5, clip = t5.to(torch_device), clip.to(torch_device)
-        inp = prepare(t5, clip, x, prompt=opts.prompt)
-        timesteps = get_schedule(
-            opts.num_steps, inp["img"].shape[1], shift=(name != "flux-schnell")
-        )
+        
+        with prof_cm as prof:
+            with record_function("prepare"):
+            # prepare input
+                x = get_noise(
+                    1,
+                    opts.height,
+                    opts.width,
+                    device=torch_device,
+                    dtype=torch.bfloat16,
+                    seed=opts.seed,
+                )
+                opts.seed = None
+                if offload:
+                    ae = ae.cpu()
+                    torch.cuda.empty_cache()
+                    t5, clip = t5.to(torch_device), clip.to(torch_device)
+                inp = prepare(t5, clip, x, prompt=opts.prompt)
+                timesteps = get_schedule(
+                    opts.num_steps, inp["img"].shape[1], shift=(name != "flux-schnell")
+                )
 
         # offload TEs to CPU, load model to gpu
-        if offload:
-            t5, clip = t5.cpu(), clip.cpu()
-            torch.cuda.empty_cache()
-            model = model.to(torch_device)
+            if offload:
+                t5, clip = t5.cpu(), clip.cpu()
+                torch.cuda.empty_cache()
+                model = model.to(torch_device)
 
-        # denoise initial noise
-        x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
+            # denoise initial noise
+            with record_function("denoise"):
+                x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
 
-        # offload model, load autoencoder to gpu
-        if offload:
-            model.cpu()
-            torch.cuda.empty_cache()
-            ae.decoder.to(x.device)
+            # offload model, load autoencoder to gpu
+            if offload:
+                model.cpu()
+                torch.cuda.empty_cache()
+                ae.decoder.to(x.device)
 
-        # decode latents to pixel space
-        x = unpack(x.float(), opts.height, opts.width)
-        with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
-            x = ae.decode(x)
+            # decode latents to pixel space
+            with record_function("decode"):
+                x = unpack(x.float(), opts.height, opts.width)
+                with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                    x = ae.decode(x)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+        if profile_json:
+            os.makedirs(os.path.dirname(profile_json) or ".", exist_ok=True)
+            trace_path = profile_json
+            if not os.path.isabs(trace_path) and not trace_path.startswith(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+                trace_path = os.path.join(output_dir, trace_path)
+            try:
+                if 'prof' in locals() and prof is not None:
+                    prof.export_chrome_trace(trace_path)
+                    print(f"Wrote Perfetto trace: {trace_path}")
+                    print(prof.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=40
+                    ))
+
+            except RuntimeError as e:
+                print(f"Failed to export trace to {trace_path}: {e}") 
+
         t1 = time.perf_counter()
 
         fn = output_name.format(idx=idx)

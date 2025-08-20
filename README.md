@@ -15,10 +15,25 @@ source .venv/bin/activate
 pip install -e ".[all]"
 ```
 
-### Models
+## AMD MI300X Installation
+```bash
+cd $HOME && git clone https://github.com/saglamutku/flux_triton.git
+cd $HOME/flux_triton
+uv venv .venv
+source .venv/bin/activate
+uv pip install -e ".[all]"
+uv  pip install --pre torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/rocm6.3
+#Example command
+python3 -m flux --name flux-schnell --height 1360 --width 768 --prompt "very cute golden retriever"  --warmup true --warmup_steps 1 
+```
+## Some Numbers with MI300X for inference. 
+- Without Torch.Compile -> 1129.9 ms
+- With TRITON_RMS enabled -> 1046.8 ms
+- Directly Torch.Compile -> 1020.9 ms
+- With TORCHINDUCTOR_CPP_WRAPPER enabled -> 927.9 ms
+- Options: (flux-schnell, height 1360, width 768, warmup true, warmup steps 1)
 
 We are offering three models:
-
 - `FLUX.1 [pro]` the base model, available via API
 - `FLUX.1 [dev]` guidance-distilled variant
 - `FLUX.1 [schnell]` guidance and step-distilled variant
